@@ -3,16 +3,17 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
-import random
 import signal
 import traceback
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 import aiosqlite
-from dnslib import AAAA, NS, QTYPE, RR, SOA, A, DNSHeader, DNSRecord
+from dnslib import AAAA, NS, QTYPE, RR, SOA, A, DNSError, DNSHeader, DNSRecord
 
+from chia.seeder.crawl_store import CrawlStore
 from chia.util.chia_logging import initialize_logging
 from chia.util.config import load_config
 from chia.util.default_root import DEFAULT_ROOT_PATH
@@ -26,102 +27,115 @@ log = logging.getLogger(__name__)
 
 
 class DomainName(str):
-    def __getattr__(self, item) -> DomainName:
-        return DomainName(item + "." + self)
+    def __getattr__(self, item: str) -> DomainName:
+        return DomainName(item + "." + self)  # DomainName.NS becomes DomainName("NS.DomainName")
 
 
-IP = "127.0.0.1"
+IP = "127.0.0.1"  # this is a placeholder for NS and SOA records
 
 
 class EchoServerProtocol(asyncio.DatagramProtocol):
     transport: asyncio.DatagramTransport
-    data_queue: asyncio.Queue
-    callback: Callable[[bytearray], Awaitable[Optional[bytearray]]]
+    data_queue: asyncio.Queue[tuple[DNSRecord, tuple[str, int]]]
+    callback: Callable[[DNSRecord], Awaitable[Optional[DNSRecord]]]
 
-    def __init__(self, callback) -> None:
+    def __init__(self, callback: Callable[[DNSRecord], Awaitable[Optional[DNSRecord]]]) -> None:
         self.data_queue = asyncio.Queue()
-        self.callback: Callable[[bytearray], Awaitable[Optional[bytearray]]] = callback
+        self.callback = callback
         asyncio.ensure_future(self.respond())
 
-    def connection_made(self, transport) -> None:
-        self.transport = transport
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        # we use the #ignore because transport is a subclass of BaseTransport, but we need the real type.
+        self.transport = transport  # type: ignore[assignment]
 
-    def datagram_received(self, data, addr) -> None:
-        asyncio.ensure_future(self.handler(data, addr))
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        try:
+            dns_request: DNSRecord = DNSRecord.parse(data)  # it's better to parse here, so we have a real type.
+        except DNSError as e:
+            log.warning(f"Received invalid DNS request: {e}")
+            return
+        except Exception as e:
+            log.error(f"Exception when receiving a datagram: {e}. Traceback: {traceback.format_exc()}.")
+            return
+        asyncio.ensure_future(self.handler(dns_request, addr))
 
     async def respond(self) -> None:
         while True:
             try:
-                resp, caller = await self.data_queue.get()
-                self.transport.sendto(resp, caller)
+                reply, caller = await self.data_queue.get()
+                self.transport.sendto(reply.pack(), caller)
             except Exception as e:
                 log.error(f"Exception: {e}. Traceback: {traceback.format_exc()}.")
 
-    async def handler(self, data, caller) -> None:
+    async def handler(self, data: DNSRecord, caller: tuple[str, int]) -> None:
         try:
             data = await self.callback(data)
             if data is None:
                 return
             await self.data_queue.put((data, caller))
         except Exception as e:
-            log.error(f"Exception: {e}. Traceback: {traceback.format_exc()}.")
+            log.error(f"Exception during DNS record processing: {e}. Traceback: {traceback.format_exc()}.")
 
 
+@dataclass
 class DNSServer:
-    reliable_peers_v4: List[str]
-    reliable_peers_v6: List[str]
-    lock: asyncio.Lock
-    pointer: int
-    crawl_db: aiosqlite.Connection
-    shutdown_event: asyncio.Event
-    reliable_task: asyncio.Task
-    transport: asyncio.DatagramTransport
-    protocol: EchoServerProtocol
-    dns_port: int
-    db_path: Path
-    domain: DomainName
-    ns1: DomainName
-    ns2: Optional[DomainName]
-    ns_records: List[RR]
-    ttl: int
-    soa_record: RR
+    config: Dict[str, Any]
+    root_path: Path
+    lock: asyncio.Lock = asyncio.Lock()
+    shutdown_event: asyncio.Event = asyncio.Event()
+    db_connection: aiosqlite.Connection = field(init=False)
+    crawl_store: CrawlStore = field(init=False)
+    reliable_task: asyncio.Task[None] = field(init=False)
+    transport: asyncio.DatagramTransport = field(init=False)
+    protocol: EchoServerProtocol = field(init=False)
+    dns_port: int = field(init=False)
+    db_path: Path = field(init=False)
+    domain: DomainName = field(init=False)
+    ns1: DomainName = field(init=False)
+    ns2: Optional[DomainName] = field(init=False)
+    ns_records: List[RR] = field(init=False)
+    ttl: int = field(init=False)
+    soa_record: RR = field(init=False)
+    reliable_peers_v4: List[str] = field(default_factory=list)
+    reliable_peers_v6: List[str] = field(default_factory=list)
+    pointer_v4: int = 0
+    pointer_v6: int = 0
 
-    def __init__(self, config: Dict[str, Any], root_path: Path) -> None:
-        self.reliable_peers_v4 = []
-        self.reliable_peers_v6 = []
-        self.lock = asyncio.Lock()
-        self.shutdown_event: asyncio.Event = asyncio.Event()
-        self.pointer_v4 = 0
-        self.pointer_v6 = 0
-
-        # Server Config
-        self.dns_port: int = config.get("dns_port", 53)
+    def __post_init__(self) -> None:
+        """
+        We initialize all the variables set to field(init=False) here.
+        """
+        # From Config
+        self.dns_port: int = self.config.get("dns_port", 53)
         # DB Path
-        crawler_db_path: str = config.get("crawler_db_path", "crawler.db")
-        self.db_path: Path = path_from_root(root_path, crawler_db_path)
+        crawler_db_path: str = self.config.get("crawler_db_path", "crawler.db")
+        self.db_path: Path = path_from_root(self.root_path, crawler_db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # DNS info
-        self.domain: DomainName = DomainName(config["domain_name"])
-        self.ns1: DomainName = DomainName(config["nameserver"])
-        self.ns2: Optional[DomainName] = DomainName(config["nameserver2"]) if config.get("nameserver2") else None
+        self.domain: DomainName = DomainName(self.config["domain_name"])
+        self.ns1: DomainName = DomainName(self.config["nameserver"])
+        self.ns2: Optional[DomainName] = (
+            DomainName(self.config["nameserver2"]) if self.config.get("nameserver2") else None
+        )
         self.ns_records: List[NS] = [NS(self.ns1), NS(self.ns2)] if self.ns2 else [NS(self.ns1)]
-        self.ttl: int = config["ttl"]
+        self.ttl: int = self.config["ttl"]
         self.soa_record: SOA = SOA(
             mname=self.ns1,  # primary name server
-            rname=config["soa"]["rname"],  # email of the domain administrator
+            rname=self.config["soa"]["rname"],  # email of the domain administrator
             times=(
-                config["soa"]["serial_number"],
-                config["soa"]["refresh"],
-                config["soa"]["retry"],
-                config["soa"]["expire"],
-                config["soa"]["minimum"],
+                self.config["soa"]["serial_number"],
+                self.config["soa"]["refresh"],
+                self.config["soa"]["retry"],
+                self.config["soa"]["expire"],
+                self.config["soa"]["minimum"],
             ),
         )
 
     @asynccontextmanager
     async def run(self) -> AsyncIterator[None]:
         await self.setup_signal_handlers()
-        self.crawl_db = await aiosqlite.connect(self.db_path, timeout=60)
+        self.db_connection = await aiosqlite.connect(self.db_path, timeout=60)
+        self.crawl_store = CrawlStore(self.db_connection)
         # Get a reference to the event loop as we plan to use
         # low-level APIs.
         loop = asyncio.get_running_loop()
@@ -150,22 +164,16 @@ class DNSServer:
         asyncio.create_task(self.stop())
 
     async def stop(self) -> None:
-        await self.crawl_db.close()
+        self.reliable_task.cancel()  # cancel the task
+        await self.db_connection.close()
         self.transport.close()
         self.shutdown_event.set()
 
     async def periodically_get_reliable_peers(self) -> None:
         sleep_interval = 0
-        while True:
+        while not self.shutdown_event.is_set():
             try:
-                new_reliable_peers = []
-                async with self.crawl_db.execute(
-                    "SELECT * from good_peers",
-                ) as cursor:
-                    async for row in cursor:
-                        new_reliable_peers.append(row[0])
-                if len(new_reliable_peers) > 0:
-                    random.shuffle(new_reliable_peers)
+                new_reliable_peers = await self.crawl_store.get_good_peers()
                 async with self.lock:
                     self.reliable_peers_v4 = []
                     self.reliable_peers_v6 = []
@@ -217,9 +225,8 @@ class DNSServer:
                 self.pointer_v6 = (self.pointer_v6 + ipv6_count) % size
             return peers
 
-    async def dns_response(self, packet: Any) -> Optional[bytearray]:
+    async def dns_response(self, request: DNSRecord) -> Optional[DNSRecord]:
         try:
-            request: DNSRecord = DNSRecord.parse(packet)
             ips = [self.soa_record] + self.ns_records
             ipv4_count = 0
             ipv6_count = 0
@@ -249,7 +256,7 @@ class DNSServer:
                     except ValueError:
                         continue
                     ips.append(AAAA(peer))
-            reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=len(ips), ra=1), q=request.q)
+            reply: DNSRecord = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=len(ips), ra=1), q=request.q)
 
             records = {
                 self.domain: ips,
@@ -276,7 +283,7 @@ class DNSServer:
                 for nameserver in self.ns_records:
                     reply.add_ar(RR(rname=self.domain, rtype=QTYPE.NS, rclass=1, ttl=self.ttl, rdata=nameserver))
                 reply.add_auth(RR(rname=self.domain, rtype=QTYPE.SOA, rclass=1, ttl=self.ttl, rdata=self.soa_record))
-            return reply.pack()
+            return reply
         except Exception as e:
             log.error(f"Exception: {e}. Traceback: {traceback.format_exc()}.")
             return None
